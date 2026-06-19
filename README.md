@@ -107,6 +107,31 @@ Every `async def run(ctx)` receives:
 | `sqlite/upsert` | Auto-create table + upsert rows |
 | `mongo/upsert` | Batch upsert into MongoDB |
 
+## Multiple accounts
+
+Each account is an independent Chrome profile with its own login state:
+
+```bash
+# Default account (auto-managed Chrome)
+pipekit run xhs/search --keyword "camping"
+
+# Separate account — own profile, own login, own Chrome window
+pipekit --account xhs-main run xhs/search --keyword "coffee"
+
+# Connect to an existing Chrome you already have open
+pipekit --cdp 9222 run google/search --query "hello"
+```
+
+Under the hood:
+
+```
+--account default  →  ~/.pipekit/profiles/default/  →  Chrome on 127.0.0.1:199XX
+--account xhs-main →  ~/.pipekit/profiles/xhs-main/ →  Chrome on 127.0.0.1:199YY
+--cdp 9222         →  connect_over_cdp → uses first existing context as master
+```
+
+Each account's debug port is persisted to disk and reused across restarts.
+
 ## How it works
 
 ```
@@ -138,6 +163,10 @@ pipekit list                          # List all pipelines
 pipekit info <name>                   # Show input/output schema
 pipekit run <name> [--input '{}']     # Run by name
 pipekit run --file ./my.pipeline.py   # Run by path
+
+pipekit --account <name> run ...      # Use a specific Chrome profile
+pipekit --cdp <port> run ...          # Connect to existing Chrome
+
 pipekit daemon start|stop|status      # Manage browser daemon
 ```
 
