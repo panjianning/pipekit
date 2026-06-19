@@ -159,15 +159,33 @@ Pipeline discovery (highest priority first):
 ## CLI
 
 ```bash
+# Pipelines
 pipekit list                          # List all pipelines
 pipekit info <name>                   # Show input/output schema
 pipekit run <name> [--input '{}']     # Run by name
 pipekit run --file ./my.pipeline.py   # Run by path
 
+# Contexts (named browser windows)
+pipekit context create <name>         # New isolated context (inherits login)
+pipekit context create <name> --account xhs  # From specific account
+pipekit context list                  # List active contexts
+pipekit context destroy <name>        # Close a context
+
+# Browser atoms (operate on a context)
+pipekit navigate --context <name> --url "https://..."
+pipekit snapshot --context <name>              # Accessibility tree
+pipekit click --context <name> --selector "..."
+pipekit fill --context <name> --selector "..." --value "..."
+pipekit evaluate --context <name> --script "..."
+pipekit screenshot --context <name> --path ...
+pipekit wait --context <name> [--selector ...]
+
+# Accounts
 pipekit --account <name> run ...      # Use a specific Chrome profile
 pipekit --cdp <port> run ...          # Connect to existing Chrome
 
-pipekit daemon start|stop|status      # Manage browser daemon
+# Daemon
+pipekit daemon start|stop|status
 ```
 
 ## License

@@ -25,7 +25,17 @@ import signal
 from pathlib import Path
 from typing import Any
 
-from .browser import BrowserSession, _pipekit_root
+from .browser import BrowserSession, ContextStore, _pipekit_root
+from .browser.actions import (
+    click,
+    evaluate,
+    fill,
+    navigate,
+    snapshot,
+    take_screenshot,
+    type_text,
+    wait_for,
+)
 from .pipeline.runner import PipelineRunner
 
 logger = logging.getLogger(__name__)
@@ -64,6 +74,7 @@ class DaemonServer:
     def __init__(self) -> None:
         self._runner = PipelineRunner()
         self._sessions: dict[str, BrowserSession] = {}
+        self._contexts = ContextStore()
         self._server: asyncio.AbstractServer | None = None
         self._idle_task: asyncio.Task[None] | None = None
 
@@ -95,6 +106,8 @@ class DaemonServer:
         if self._idle_task is not None:
             self._idle_task.cancel()
             self._idle_task = None
+
+        await self._contexts.destroy_all()
 
         for session in self._sessions.values():
             try:
@@ -135,9 +148,14 @@ class DaemonServer:
             await writer.wait_closed()
 
     async def _idle_cleaner(self) -> None:
-        """Periodically close idle sessions. Shut down if all sessions gone."""
+        """Periodically close idle sessions and contexts."""
         while True:
             await asyncio.sleep(30)
+
+            # Clean idle contexts
+            await self._contexts.cleanup_idle()
+
+            # Clean idle sessions
             to_remove = [
                 name
                 for name, session in self._sessions.items()
@@ -148,8 +166,9 @@ class DaemonServer:
                     await self._sessions[name].close()
                 del self._sessions[name]
 
-            if not self._sessions and self._server is not None:
-                logger.info("All sessions idle — shutting down daemon")
+            # Shut down if nothing is alive
+            if not self._sessions and not self._contexts.list() and self._server is not None:
+                logger.info("All sessions and contexts idle — shutting down daemon")
                 asyncio.create_task(self.shutdown())
 
     # ------------------------------------------------------------------
@@ -259,6 +278,89 @@ class DaemonServer:
                     "errors": [s.error for s in run.steps if s.error],
                 },
             }
+
+        # -- context commands --
+        if entity == "context":
+            account = str(req.get("account", "default"))
+
+            if action == "create":
+                name = str(req.get("name", "")).strip()
+                if not name:
+                    return {"ok": False, "error": "context create requires name"}
+                session = await self._get_session(account, cdp)
+                result = await self._contexts.create(name, session)
+                return {"ok": True, "data": result}
+
+            if action == "list":
+                return {"ok": True, "data": self._contexts.list()}
+
+            if action == "destroy":
+                name = str(req.get("name", "")).strip()
+                result = await self._contexts.destroy(name)
+                return {"ok": True, "data": result}
+
+        # -- browser atomic actions --
+        if entity == "browser":
+            ctx_name = str(req.get("context", "")).strip()
+            entry = self._contexts.get(ctx_name)
+            params = req.get("params") if isinstance(req.get("params"), dict) else {}
+
+            if action == "navigate":
+                url = str(params.get("url", ""))
+                if not url:
+                    return {"ok": False, "error": "navigate requires url"}
+                data = await navigate(entry, url)
+                return {"ok": True, "data": data}
+
+            if action == "snapshot":
+                sel = params.get("selector")
+                compact = params.get("compact", True)
+                data = await snapshot(entry, selector=sel, compact=compact)
+                return {"ok": True, "data": data}
+
+            if action == "click":
+                sel = str(params.get("selector", ""))
+                if not sel:
+                    return {"ok": False, "error": "click requires selector"}
+                data = await click(entry, sel)
+                return {"ok": True, "data": data}
+
+            if action == "fill":
+                sel = str(params.get("selector", ""))
+                val = str(params.get("value", ""))
+                if not sel:
+                    return {"ok": False, "error": "fill requires selector"}
+                data = await fill(entry, sel, val)
+                return {"ok": True, "data": data}
+
+            if action == "type":
+                sel = str(params.get("selector", ""))
+                text = str(params.get("text", ""))
+                if not sel:
+                    return {"ok": False, "error": "type requires selector"}
+                data = await type_text(entry, sel, text)
+                return {"ok": True, "data": data}
+
+            if action == "evaluate":
+                script = str(params.get("script", ""))
+                if not script:
+                    return {"ok": False, "error": "evaluate requires script"}
+                data = await evaluate(entry, script)
+                return {"ok": True, "data": data}
+
+            if action == "screenshot":
+                path = params.get("path")
+                sel = params.get("selector")
+                full = bool(params.get("full_page", False))
+                data = await take_screenshot(entry, path=path, selector=sel, full_page=full)
+                return {"ok": True, "data": data}
+
+            if action == "wait":
+                sel = params.get("selector")
+                timeout = int(params.get("timeout", 3000))
+                state = str(params.get("state", "visible"))
+                data = await wait_for(entry, selector=sel, timeout=timeout, state=state)
+                return {"ok": True, "data": data}
 
         return {"ok": False, "error": f"Unknown command: {entity}/{action}"}
 
