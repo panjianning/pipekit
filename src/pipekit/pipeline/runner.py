@@ -98,7 +98,7 @@ class PipelineRunner:
         browser_ctx = await session.isolate_with_login()
         try:
             # Build sub-pipeline resolver (closure over discover + session)
-            async def _sub_resolver(name: str) -> Any:
+            def _sub_resolver(name: str) -> Any:
                 resolved = self._discover.resolve(name)
                 if resolved is None:
                     return None
