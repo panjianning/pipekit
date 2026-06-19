@@ -135,11 +135,12 @@ async def _dispatch_daemon(args: argparse.Namespace, action: str) -> None:
 
 async def _dispatch_context(args: argparse.Namespace, action: str) -> None:
     if action == "create":
+        account = (getattr(args, "account", None) or "default")
         resp = await send_request({
             "entity": "context",
             "action": "create",
             "name": getattr(args, "name", ""),
-            "account": getattr(args, "account", None) or "default",
+            "account": account,
         })
         _print(resp)
         return
@@ -244,7 +245,9 @@ def build_parser() -> argparse.ArgumentParser:
     _add_shortcuts(sub)
 
     # --- context ---
-    ctx_cmd = sub.add_parser("context", help="Manage named browser contexts")
+    ctx_cmd = sub.add_parser(
+        "context", help="Manage named browser contexts"
+    )
     ctx_sub = ctx_cmd.add_subparsers(dest="action", required=True)
     ctx_create = ctx_sub.add_parser("create", help="Create a new context")
     ctx_create.add_argument("name", help="Context name")
@@ -322,10 +325,8 @@ def main() -> None:
     parser = build_parser()
     args, unknown = parser.parse_known_args()
 
-    entity = getattr(args, "entity", None)
-    action = getattr(args, "action", None)
-
-    if entity in ("pipeline", "run") and action in ("run", None):
+    # Allow --account and --cdp anywhere in the command line
+    if unknown:
         try:
             parsed = _parse_flag_kv(unknown)
             if "account" in parsed and not getattr(args, "account", None):
@@ -334,11 +335,15 @@ def main() -> None:
                 args.cdp = str(parsed.pop("cdp"))
             if "file" in parsed and not getattr(args, "file", None):
                 args.file = str(parsed.pop("file"))
-            args.extra_args = parsed
+            if "context" in parsed and not getattr(args, "context", None):
+                args.context = str(parsed.pop("context"))
+            # Remaining unknown args become extra pipeline input
+            if parsed:
+                if not hasattr(args, "extra_args"):
+                    args.extra_args = {}
+                args.extra_args.update(parsed)
         except ValueError as exc:
             parser.error(str(exc))
-    elif unknown:
-        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
 
     try:
         asyncio.run(_run(args))
