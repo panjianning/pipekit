@@ -1,17 +1,19 @@
 """Browser session management — one Chromium process per account.
 
-Key design:
-- Managed mode: Playwright launches Chrome via launch_persistent_context
-- CDP mode: connects to existing Chrome via connect_over_cdp
-- Task isolation: clone storageState from master → newContext()
+Managed mode: launches Chrome via subprocess, connects via CDP.
+CDP mode: connects to an existing Chrome via connect_over_cdp.
+Task isolation: clone storageState from master → newContext().
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import shutil
+import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -50,6 +52,50 @@ def _pipekit_root() -> Path:
 
 def _profile_dir(account_name: str) -> Path:
     return _pipekit_root() / "profiles" / account_name
+
+
+def _kill_chrome_with_profile(user_data_dir: str) -> None:
+    """Kill any Chrome processes using the given user-data-dir.
+
+    Without this, a new Chrome launch with the same profile will silently
+    open in the existing window, ignoring --remote-debugging-port.
+    """
+    profile = os.path.realpath(user_data_dir)
+    for pid in _find_chrome_pids():
+        try:
+            cmdline = _read_proc_cmdline(pid)
+            if cmdline and profile in cmdline:
+                logger.info("Killing stale Chrome pid=%d using %s", pid, profile)
+                os.kill(pid, signal.SIGTERM)
+        except (OSError, ProcessLookupError):
+            pass
+
+
+def _find_chrome_pids() -> list[int]:
+    """Return PIDs of running Chrome/Chromium processes."""
+    try:
+        result = subprocess.run(
+            ["pgrep", "-f", "Google Chrome"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return [int(pid) for pid in result.stdout.strip().split("\n") if pid]
+    except Exception:
+        pass
+    return []
+
+
+def _read_proc_cmdline(pid: int) -> str | None:
+    """Read the command line of a process by PID."""
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+    except Exception:
+        return None
 
 
 def _allocate_port(account_name: str) -> int:
@@ -103,13 +149,11 @@ def _allocate_port(account_name: str) -> int:
 class BrowserSession:
     """One browser process per account.
 
-    Managed mode (no --cdp):
-        launch_persistent_context(user_data_dir=profiles/<name>)
-        → master context is the persistent one
-        → login cookies survive restarts
+    Launches Chrome directly as a subprocess (not via Playwright's managed
+    launch) to avoid bot detection. Connects via CDP for full control.
 
     CDP mode (--cdp <port>):
-        connect_over_cdp → use the first existing context as master
+        connect_over_cdp → use the first existing context as master.
     """
 
     def __init__(self, account_name: str = "default", cdp_target: str | None = None) -> None:
@@ -119,6 +163,8 @@ class BrowserSession:
         self._browser: Browser | None = None
         self._master_context: BrowserContext | None = None
         self._last_used: float = 0.0
+        self._chrome_proc: asyncio.subprocess.Process | None = None
+        self._debug_port: int = 0
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -135,14 +181,31 @@ class BrowserSession:
         return self._browser
 
     async def close(self) -> None:
-        """Close the browser and stop Playwright."""
+        """Close the browser gracefully, preserving cookies to disk."""
+        # Try graceful CDP shutdown first (flushes cookies)
         if self._browser and self._browser.is_connected():
             try:
                 await self._browser.close()
             except Exception:
-                logger.debug("Error closing browser", exc_info=True)
+                logger.debug("Error closing browser via CDP", exc_info=True)
         self._browser = None
         self._master_context = None
+
+        # Wait a moment for Chrome to flush to disk, then terminate
+        if self._chrome_proc is not None:
+            try:
+                await asyncio.wait_for(self._chrome_proc.wait(), timeout=3)
+            except TimeoutError:
+                self._chrome_proc.terminate()
+                try:
+                    await asyncio.wait_for(self._chrome_proc.wait(), timeout=2)
+                except TimeoutError:
+                    self._chrome_proc.kill()
+                    await self._chrome_proc.wait()
+            except Exception:
+                logger.debug("Error waiting for chrome", exc_info=True)
+            self._chrome_proc = None
+
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
@@ -163,12 +226,11 @@ class BrowserSession:
         if self._master_context is not None:
             return self._master_context
         browser = await self.ensure_browser()
-        if self.cdp_target:
-            contexts = browser.contexts
-            self._master_context = contexts[0] if contexts else await browser.new_context()
-        # managed: _start_browser already set _master_context via launch_persistent_context
-        if self._master_context is None:
-            raise RuntimeError("No master context available")
+        contexts = browser.contexts
+        if contexts:
+            self._master_context = contexts[0]
+        else:
+            self._master_context = await browser.new_context()
         return self._master_context
 
     async def isolate_with_login(self) -> BrowserContext:
@@ -199,42 +261,74 @@ class BrowserSession:
             await self._start_managed()
 
     async def _start_managed(self) -> None:
-        """Launch Chrome with a persistent profile so login cookies survive restart."""
+        """Launch Chrome via subprocess, then connect via CDP.
+
+        Avoids Playwright's managed launch which adds --enable-automation
+        and other flags that trigger bot detection.
+        """
         assert self._playwright is not None
 
         user_data = str(_profile_dir(self.account_name))
         chrome_bin = self._find_chrome()
-        debug_port = _allocate_port(self.account_name)
+        self._debug_port = _allocate_port(self.account_name)
+
+        # Kill any previous Chrome using our profile, otherwise Chrome
+        # reuses the existing window and ignores our --remote-debugging-port
+        _kill_chrome_with_profile(user_data)
+
+        # Flags for a natural-looking Chrome: no automation indicators
+        args = [
+            chrome_bin,
+            f"--remote-debugging-port={self._debug_port}",
+            f"--user-data-dir={user_data}",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-features=ChromeWhatsNewUI",
+            "--disable-dev-shm-usage",
+            "--window-size=1440,900",
+        ]
 
         logger.info(
-            "Launching managed Chrome profile=%s port=%d", user_data, debug_port
+            "Launching Chrome %s profile=%s port=%d",
+            chrome_bin, user_data, self._debug_port,
         )
-        self._master_context = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=user_data,
-            headless=False,
-            executable_path=chrome_bin,
-            args=[
-                "--no-first-run",
-                "--no-default-browser-check",
-                f"--remote-debugging-port={debug_port}",
-            ],
+
+        self._chrome_proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        self._browser = self._master_context.browser
+
+        # Wait for Chrome to be ready on the debug port
+        await self._connect_cdp(f"127.0.0.1:{self._debug_port}")
 
     async def _start_cdp(self) -> None:
         """Connect to an existing Chrome via CDP."""
         assert self._playwright is not None
         assert self.cdp_target is not None
+        await self._connect_cdp(self.cdp_target)
 
-        endpoints = await self._resolve_cdp_endpoints(self.cdp_target)
-        for ep in endpoints:
-            try:
-                self._browser = await self._playwright.chromium.connect_over_cdp(ep)
-                logger.info("Connected CDP %s", self.cdp_target)
-                return
-            except Exception:
-                logger.debug("CDP endpoint %s failed", ep)
-        raise RuntimeError(f"Failed to connect to CDP target: {self.cdp_target}")
+    async def _connect_cdp(self, target: str) -> None:
+        """Connect to Chrome at *target* (e.g. '127.0.0.1:9222'), retrying."""
+        assert self._playwright is not None
+
+        endpoints = await self._resolve_cdp_endpoints(target)
+        last_error: Exception | None = None
+
+        for attempt in range(30):  # up to 15 seconds
+            for ep in endpoints:
+                try:
+                    self._browser = await self._playwright.chromium.connect_over_cdp(ep)
+                    logger.info("Connected CDP target=%s", target)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    logger.debug("CDP attempt %d for %s failed", attempt, ep)
+            await asyncio.sleep(0.5)
+
+        raise RuntimeError(
+            f"Failed to connect to Chrome CDP at {target}: {last_error}"
+        )
 
     # ------------------------------------------------------------------
     # CDP endpoint resolution

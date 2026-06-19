@@ -224,11 +224,18 @@ async def run(ctx: Any) -> dict[str, Any]:
     page = await ctx.browser.navigate("https://www.xiaohongshu.com")
     await page.wait_for_timeout(3000)
 
-    # 2. Check login (XHS uses a1 cookie for identity)
-    a1_cookie = await page.evaluate(
-        "() => document.cookie.includes('a1')"
+    # 2. Check login — reliable XHS login indicators
+    logged_in = await page.evaluate(
+        """() => {
+            // Key indicator: XHS uses 'un-loggedIn' class on sidebar when not logged in
+            if (document.querySelector('.side-bar-ai-un-loggedIn')) return false;
+            // Also check for login button text
+            var body = document.body ? document.body.innerText || '' : '';
+            if (body.indexOf('手机号登录') !== -1 && body.indexOf('获取验证码') !== -1) return false;
+            return true;
+        }"""
     )
-    if not a1_cookie:
+    if not logged_in:
         raise RuntimeError(
             "Not logged in to XHS. "
             "Open the Chrome window, log in at https://www.xiaohongshu.com, "
