@@ -29,5 +29,6 @@ Thumbs.db
 # PipeKit runtime artifacts
 .pipekit/runs/
 *.log
+*.port
 
 # uv (uv.lock is committed for reproducible builds)

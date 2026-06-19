@@ -52,6 +52,49 @@ def _profile_dir(account_name: str) -> Path:
     return _pipekit_root() / "profiles" / account_name
 
 
+def _allocate_port(account_name: str) -> int:
+    """Find a free TCP port for Chrome remote debugging.
+
+    First tries to reuse the last-used port (stored on disk).
+    If that fails, finds a free port and persists it.
+    """
+    import socket
+
+    port_file = _pipekit_root() / "run" / f"chrome-{account_name}.port"
+
+    # Try last-used port first
+    if port_file.exists():
+        try:
+            last_port = int(port_file.read_text().strip())
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(("127.0.0.1", last_port))
+                return last_port
+        except (ValueError, OSError):
+            pass  # port in use or invalid, find a new one
+
+    # Find a free port
+    base = 19970
+    offset = abs(hash(account_name)) % 100
+    for attempt in range(20):
+        port = base + offset + attempt
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            try:
+                s.bind(("127.0.0.1", port))
+                port_file.parent.mkdir(parents=True, exist_ok=True)
+                port_file.write_text(str(port))
+                return port
+            except OSError:
+                continue
+
+    # Last resort: let OS pick
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        port_file.parent.mkdir(parents=True, exist_ok=True)
+        port_file.write_text(str(port))
+        return port
+
+
 # ---------------------------------------------------------------------------
 # BrowserSession
 # ---------------------------------------------------------------------------
@@ -161,13 +204,20 @@ class BrowserSession:
 
         user_data = str(_profile_dir(self.account_name))
         chrome_bin = self._find_chrome()
+        debug_port = _allocate_port(self.account_name)
 
-        logger.info("Launching managed Chrome profile=%s", user_data)
+        logger.info(
+            "Launching managed Chrome profile=%s port=%d", user_data, debug_port
+        )
         self._master_context = await self._playwright.chromium.launch_persistent_context(
             user_data_dir=user_data,
             headless=False,
             executable_path=chrome_bin,
-            args=["--no-first-run", "--no-default-browser-check"],
+            args=[
+                "--no-first-run",
+                "--no-default-browser-check",
+                f"--remote-debugging-port={debug_port}",
+            ],
         )
         self._browser = self._master_context.browser
 
