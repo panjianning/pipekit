@@ -388,7 +388,9 @@ class DaemonServer:
 async def send_request(payload: dict[str, Any]) -> dict[str, Any]:
     """Send a JSON-line request to the running daemon."""
     port = int(_port_path().read_text(encoding="utf-8").strip())
-    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", port, limit=10 * 1024 * 1024  # 10 MB
+    )
     try:
         writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
